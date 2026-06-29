@@ -353,7 +353,7 @@ import paho.mqtt.client as mqtt
 import threading
 import time
 import queue
-from streamlit.runtime.scriptrunner import add_script_run_ctx 
+
 
 
 # =========================================================================
@@ -378,22 +378,20 @@ MQTT_CONFIG = {
 # Force layout optimization to wide screen format
 st.set_page_config(page_title="SMN Enterprise Hub", layout="wide")
 
-# Safe thread-isolated cross-execution context containers
-if "latest_edu" not in st.session_state:
-    st.session_state["latest_edu"] = {}
-if "latest_slots" not in st.session_state:
-    st.session_state["latest_slots"] = {}
-if "heartbeat" not in st.session_state:
-    st.session_state["heartbeat"] = {"system": "OFFLINE", "uptime": 0}
+# --- NEW SAFE GLOBAL CACHE OBJECTS (Bypasses session_state thread crashes) ---
+if "RAW_EDU" not in globals():
+    globals()["RAW_EDU"] = {}
+if "RAW_SLOTS" not in globals():
+    globals()["RAW_SLOTS"] = {}
+if "RAW_HEARTBEAT" not in globals():
+    globals()["RAW_HEARTBEAT"] = {"system": "OFFLINE", "uptime": 0}
 
-# Non-blocking buffer queue for background database logging
 db_write_queue = queue.Queue(maxsize=1000)
 
 # =========================================================================
 # ASYNCHRONOUS DATABASE LOGGER THREAD
 # =========================================================================
 def async_db_logger_worker():
-    """Consumes telemetry events sequentially without freezing the MQTT client"""
     while True:
         item = db_write_queue.get()
         if item is None:
@@ -415,10 +413,13 @@ def async_db_logger_worker():
             db_write_queue.task_done()
 
 # =========================================================================
-# AUTOMATED BACKGROUND MQTT AGENT (LAG-FREE)
+# AUTOMATED BACKGROUND MQTT AGENT (SAFE FOR PYTHON 3.14 + PAHO MQTT V2)
 # =========================================================================
 def run_mqtt_bridge_worker():
-    """Background engine running indefinitely to pipe MQTT packets safely"""
+    # Fix the deprecation warning by defining the explicit callback API version 
+    client = mqtt.Client(callback_api_version=mqtt.CallbackAPIVersion.VERSION1)
+    client.username_pw_set(MQTT_CONFIG["user"], MQTT_CONFIG["pass"])
+
     def on_connect(client, userdata, flags, rc):
         client.subscribe(MQTT_CONFIG["topic"])
 
@@ -428,55 +429,44 @@ def run_mqtt_bridge_worker():
             payload_str = msg.payload.decode("utf-8")
             parsed_payload = json.loads(payload_str)
             
-            # FAST PATH INGESTION: Updates session state instantly for live UI tracking
+            # Write straight to plain global Python dictionaries (Completely thread-safe and crash-proof)
             if topic == "SMN/EDU":
-                st.session_state["latest_edu"] = parsed_payload
+                globals()["RAW_EDU"] = parsed_payload
             elif topic == "SMN/HEARTBEAT":
-                st.session_state["heartbeat"] = parsed_payload
+                globals()["RAW_HEARTBEAT"] = parsed_payload
             elif topic.startswith("SMN/SLOT_"):
                 try:
                     slot_id = int(topic.split("_")[-1])
-                    st.session_state["latest_slots"][slot_id] = parsed_payload
+                    globals()["RAW_SLOTS"][slot_id] = parsed_payload
                 except ValueError:
                     pass
             
-            # Queue database logging asynchronously without locking up execution
             if not db_write_queue.full():
                 db_write_queue.put((topic, payload_str))
                 
         except Exception as e:
             print(f"MQTT Ingestion Error: {e}")
 
-    client = mqtt.Client()
-    client.username_pw_set(MQTT_CONFIG["user"], MQTT_CONFIG["pass"])
     client.on_connect = on_connect
     client.on_message = on_message
     client.connect(MQTT_CONFIG["broker"], MQTT_CONFIG["port"], 60)
     client.loop_forever()
 
 @st.cache_resource
-
-
 def initialize_system_daemons():
-    # 1. Create the threads
     t1 = threading.Thread(target=run_mqtt_bridge_worker, daemon=True)
     t2 = threading.Thread(target=async_db_logger_worker, daemon=True)
-    
-    # 2. Bind Streamlit's tracking context to clean up logs
-    add_script_run_ctx(t1)
-    add_script_run_ctx(t2)
-    
-    # 3. Fire them up
+    # NO add_script_run_ctx CALLS HERE AT ALL
     t1.start()
     t2.start()
     return True
 
 initialize_system_daemons()
 
-# Pull thread-safe snapshots for this UI draw frame
-latest_edu = st.session_state["latest_edu"]
-latest_slots = st.session_state["latest_slots"]
-hb = st.session_state["heartbeat"]
+# Pull the fresh snapshots straight into your local layout frame
+latest_edu = globals()["RAW_EDU"]
+latest_slots = globals()["RAW_SLOTS"]
+hb = globals()["RAW_HEARTBEAT"]
 
 # =========================================================================
 # PRESERVED PRETTY WEB-APP LAYOUT & PRESENTATION ENGINE
