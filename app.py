@@ -8,10 +8,10 @@ import json
 # ==========================================
 DB_CONFIG = {
     "dbname": "postgres",
-    "user": "postgres",
+    "user": "postgres.ehncmhxcratiyupmkzpv",            # <-- Make sure this matches your new user format!
     "password": "Ngtech@19#19",
-    "host": "db.ehncmhxcratiyupmkzpv.supabase.co",
-    "port": "5432"
+    "host": "aws-1-eu-north-1.pooler.supabase.com",     # <-- Your new European pooler host
+    "port": "6543"                                      # <-- Dedicated pooling port
 }
 
 st.set_page_config(page_title="SMN Enterprise Hub", layout="wide")
