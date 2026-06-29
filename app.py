@@ -353,6 +353,9 @@ import paho.mqtt.client as mqtt
 import threading
 import time
 import queue
+from streamlit.runtime.scriptrunner 
+import add_script_run_ctx 
+
 
 # =========================================================================
 # CENTRAL RESOURCE CONFIGURATION
@@ -453,10 +456,19 @@ def run_mqtt_bridge_worker():
     client.loop_forever()
 
 @st.cache_resource
+
+
 def initialize_system_daemons():
+    # 1. Create the threads
     t1 = threading.Thread(target=run_mqtt_bridge_worker, daemon=True)
-    t1.start()
     t2 = threading.Thread(target=async_db_logger_worker, daemon=True)
+    
+    # 2. Bind Streamlit's tracking context to clean up logs
+    add_script_run_ctx(t1)
+    add_script_run_ctx(t2)
+    
+    # 3. Fire them up
+    t1.start()
     t2.start()
     return True
 
