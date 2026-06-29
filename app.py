@@ -155,7 +155,7 @@ else:
             except Exception:
                 pass
 
-    # 3. Process EDU/Generator Source Parameters
+    # 3. Process EDU/Generator Source Parameters with Bulletproof Cleaning
     latest_edu = {}
     if not edu_records.empty:
         try:
@@ -258,9 +258,9 @@ else:
                         </div>
                         """, unsafe_allow_html=True)
 
-    # --- TAB 2: ASSET LIFECYCLE LEDGER ---
+    # --- TAB 2: ASSET LIFECYCLE LEDGER & INSPECTOR ---
     with tab2:
-        st.header("Asset Ledger Tracker (Historical Lifecycle Data across Slots)")
+        st.header("Asset Ledger Tracker & Historical Drill-Down")
         if not battery_history:
             st.info("No identified battery profiles found inside database records.")
         else:
@@ -281,6 +281,42 @@ else:
                     "Transfer Efficiency": f"{delta_eff:.1f}%" if delta_eff > 0 else "---"
                 })
             st.dataframe(pd.DataFrame(ledger_data), use_container_width=True, hide_index=True)
+            
+            st.markdown("---")
+            st.subheader("🔍 Battery Historical Lifecycle Inspector")
+            selected_bms = st.selectbox("Select a Battery BMS Serial ID to view historical charging curve trends:", options=list(battery_history.keys()))
+            
+            if selected_bms:
+                pack_history = []
+                for _, row in slot_records.iterrows():
+                    try:
+                        p = row['payload']
+                        if isinstance(p, str):
+                            p = json.loads(p)
+                        if p.get('bms_id') == selected_bms:
+                            pack_history.append({
+                                "Timestamp": row['created_at'],
+                                "SOC (%)": int(p.get('soc', 0)),
+                                "Voltage (V)": float(p.get('bms_v', 0.0)),
+                                "Current (A)": float(p.get('bms_i', 0.0))
+                            })
+                    except Exception:
+                        pass
+                
+                if pack_history:
+                    df_history = pd.DataFrame(pack_history).sort_values(by="Timestamp")
+                    m1, m2 = st.columns(2)
+                    with m1:
+                        st.markdown(f"**State of Charge (SOC) Curve for {selected_bms}**")
+                        st.line_chart(data=df_history, x="Timestamp", y="SOC (%)", color="#2E7D32")
+                    with m2:
+                        st.markdown(f"**Voltage Profile (V) over Time**")
+                        st.line_chart(data=df_history, x="Timestamp", y="Voltage (V)", color="#0056B3")
+                        
+                    st.markdown("**Raw Transaction Logs for this Serial Asset**")
+                    st.dataframe(df_history, use_container_width=True, hide_index=True)
+                else:
+                    st.info(f"No historical chart profiles logged yet for serial asset: {selected_bms}")
 
     # --- TAB 3: POWER CONVERSION EFFICIENCY ---
     with tab3:
@@ -297,5 +333,13 @@ else:
             c2.metric("Mains Primary Input Power", "Offline")
             c3.metric("End-to-End System Efficiency", "Offline")
 
-# Global Manual UI Refresh Trigger Interlock
-st.button("Force Interface Refresh")
+# =========================================================================
+# FULLY AUTOMATED UI REFRESH LOOP
+# =========================================================================
+@st.fragment
+def auto_refresh_loop():
+    """Forces the web browser to visually update and clear caches every 5 seconds"""
+    time.sleep(5)
+    st.rerun()
+
+auto_refresh_loop()
