@@ -186,7 +186,7 @@ else:
         else:
             st.sidebar.info("🔵 Running on UTILITY GRID")
 
-        p_mains_kw = float(latest_edu.get('p_total', 0.0)) / 1000.0
+        p_mains_kw = float(latest_edu.get('p_total', 0.0))
         st.sidebar.metric("Mains Active Draw", f"{p_mains_kw:.2f} kW")
         st.sidebar.metric("Station Energy Counter", f"{latest_edu.get('energy', 0)} Wh")
     else:
