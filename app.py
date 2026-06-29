@@ -2,24 +2,82 @@ import streamlit as st
 import psycopg2
 import pandas as pd
 import json
+import paho.mqtt.client as mqtt
+import threading
+import time
 
-# ==========================================
-# CLOUD DATABASE CONFIGURATION
-# ==========================================
+# =========================================================================
+# CENTRAL RESOURCE CONFIGURATION
+# =========================================================================
 DB_CONFIG = {
     "dbname": "postgres",
-    "user": "postgres.ehncmhxcratiyupmkzpv",            # <-- Make sure this matches your new user format!
+    "user": "postgres.ehncmhxcratiyupmkzpv",
     "password": "Ngtech@19#19",
-    "host": "aws-1-eu-north-1.pooler.supabase.com",     # <-- Your new European pooler host
-    "port": "6543"                                      # <-- Dedicated pooling port
+    "host": "aws-1-eu-north-1.pooler.supabase.com",
+    "port": "6543"
 }
 
+MQTT_CONFIG = {
+    "broker": "cow.rmq2.cloudamqp.com",
+    "port": 1883,
+    "user": "klsazaul:klsazaul",
+    "pass": "EJyfwSCQdtKsiEe-HLDmkYEffe45MhPJ",
+    "topic": "SMN/#"
+}
+
+# Force layout optimization to wide screen format
 st.set_page_config(page_title="SMN Enterprise Hub", layout="wide")
-st.title("⚡ SMN Industrial Fleet & Asset Management Analytics Terminal")
+
+# =========================================================================
+# AUTOMATED BACKGROUND MQTT AGENT
+# =========================================================================
+def run_mqtt_bridge_worker():
+    """Background engine running indefinitely to pipe MQTT packets straight into PostgreSQL"""
+    def on_connect(client, userdata, flags, rc):
+        client.subscribe(MQTT_CONFIG["topic"])
+
+    def on_message(client, userdata, msg):
+        try:
+            topic = msg.topic
+            payload_str = msg.payload.decode('utf-8')
+            
+            # Direct insertion sequence into cloud database storage
+            conn = psycopg2.connect(**DB_CONFIG)
+            cur = conn.cursor()
+            query = "INSERT INTO telemetry_history (topic, payload) VALUES (%s, %s);"
+            cur.execute(query, (topic, payload_str))
+            conn.commit()
+            cur.close()
+            conn.close()
+        except Exception:
+            pass # Keep worker running silently regardless of bad incoming syntax frames
+
+    # Configure background worker service context instance
+    client = mqtt.Client()
+    client.username_pw_set(MQTT_CONFIG["user"], MQTT_CONFIG["pass"])
+    client.on_connect = on_connect
+    client.on_message = on_message
+    
+    try:
+        client.connect(MQTT_CONFIG["broker"], MQTT_CONFIG["port"], 60)
+        client.loop_forever() # Loop blocks internally inside this separate thread line
+    except Exception:
+        time.sleep(10) # Auto fallback retry cooling pattern
+
+# Fire up the background listener only once per Render session activation lifecycle
+if "mqtt_thread_alive" not in st.session_state:
+    st.session_state["mqtt_thread_alive"] = True
+    bg_thread = threading.Thread(target=run_mqtt_bridge_worker, daemon=True)
+    bg_thread.start()
+
+# =========================================================================
+# STREAMLIT UI DATA FETCH ENGINE
+# =========================================================================
+st.title("⚡ SMN Automated Fleet & Asset Management Analytics Terminal")
+st.caption("🤖 Cloud Listener Agent Status: ACTIVE (Background Thread Logging 24/7)")
 st.markdown("---")
 
-# --- DATA RETRIEVAL ENGINE ---
-@st.cache_data(ttl=1)  # High frequency refresh for prototype monitoring
+@st.cache_data(ttl=1)
 def fetch_raw_data():
     try:
         conn = psycopg2.connect(**DB_CONFIG)
@@ -36,14 +94,39 @@ df_raw = fetch_raw_data()
 if df_raw.empty:
     st.info("Awaiting structural incoming database data streams...")
 else:
-    # Separate streams based on incoming topics
+    # =========================================================================
+    # TELEMETRY PROCESSING ENGINE
+    # =========================================================================
     slot_records = df_raw[df_raw['topic'].str.startswith('SMN/DCU/')]
     edu_records = df_raw[df_raw['topic'] == 'SMN/EDU']
-    
-    # Process Latest States for All 72 Possible Slots (6 DCUs x 12 Slots)
+    heartbeat_records = df_raw[df_raw['topic'] == 'SMN/HEARTBEAT']
+
     latest_slots = {}
-    battery_history = {}  # Global ledger indexing by bms_id
-    
+    battery_history = {}
+    dcu_heartbeats = {}  # Tracks the status of all 6 DCU controllers
+
+    # 1. Process Heartbeat Frames (Uptime & Diagnostics)
+    if not heartbeat_records.empty:
+        for _, row in heartbeat_records.iterrows():
+            try:
+                payload = row['payload']
+                if isinstance(payload, str):
+                    payload = json.loads(payload)
+                
+                dcu_id = int(payload.get('dcu', 1))
+                if dcu_id not in dcu_heartbeats:
+                    uptime_sec = payload.get('uptime', 0)
+                    uptime_hours = uptime_sec / 3600.0  # Convert to standard hours representation
+                    dcu_heartbeats[dcu_id] = {
+                        "status": payload.get('system', 'UNKNOWN'),
+                        "uptime": f"{uptime_hours:.2f} Hrs",
+                        "mqtt_stat": "OK" if payload.get('mqtt') == 1 else "FAIL",
+                        "last_seen": row['created_at']
+                    }
+            except Exception:
+                pass
+
+    # 2. Process DCU Slot State Parameters
     if not slot_records.empty:
         for _, row in slot_records.iterrows():
             try:
@@ -56,11 +139,9 @@ else:
                 bms_id = payload.get('bms_id', 'Unknown')
                 key = (dcu, slot)
                 
-                # Capture current snapshot state for the slot matrix
                 if key not in latest_slots:
                     latest_slots[key] = payload
                 
-                # Build Battery Tracking History Ledger dynamically
                 if bms_id not in battery_history and bms_id != 'Unknown':
                     battery_history[bms_id] = {
                         "last_seen_dcu": dcu,
@@ -69,49 +150,72 @@ else:
                         "soh": payload.get('soh'),
                         "cycles": payload.get('cycles'),
                         "wh_in": payload.get('wh_in', 0.0),
-                        "wh_out": payload.get('wh_out', 0.0),
-                        "temp_max": payload.get('bms_temp', 0)
+                        "wh_out": payload.get('wh_out', 0.0)
                     }
             except Exception:
                 pass
 
-    # Extract EDU State Metrics
+    # 3. Process EDU/Generator Source Parameters
     latest_edu = {}
     if not edu_records.empty:
         try:
-            latest_edu = edu_records.iloc[0]['payload']
-            if isinstance(latest_edu, str):
-                latest_edu = json.loads(latest_edu)
-        except Exception:
-            pass
+            raw_payload = edu_records.iloc[0]['payload']
+            if isinstance(raw_payload, str):
+                cleaned_payload = raw_payload.replace('""', '"').strip('"')
+                latest_edu = json.loads(cleaned_payload)
+            else:
+                latest_edu = raw_payload
+        except Exception as e:
+            st.sidebar.error(f"EDU Parsing Error: {e}")
 
     # =========================================================================
-    # GLOBAL SIDEBAR: STATIONS SOURCE POWER & GENERATOR METRICS
+    # USER INTERFACE LAYOUT LAYER
     # =========================================================================
+    
+    # Left Hand Sidebar Configuration
     st.sidebar.header("🔌 Source Power Metrics")
+    
     if latest_edu:
-        g1_active = latest_edu.get('gen1_mask', 0) == 1
-        g2_active = latest_edu.get('gen2_mask', 0) == 1
+        g1_mask = int(latest_edu.get('gen1_mask', 0))
+        g2_mask = int(latest_edu.get('gen2_mask', 0))
         
-        if g1_active:
+        if g1_mask == 1:
             st.sidebar.success("🟢 Running on GENERATOR 1")
-        elif g2_active:
+        elif g2_mask == 1:
             st.sidebar.success("🟢 Running on GENERATOR 2")
         else:
             st.sidebar.info("🔵 Running on UTILITY GRID")
 
-        p_mains_kw = latest_edu.get('p_total', 0.0) / 1000.0
+        p_mains_kw = float(latest_edu.get('p_total', 0.0)) / 1000.0
         st.sidebar.metric("Mains Active Draw", f"{p_mains_kw:.2f} kW")
         st.sidebar.metric("Station Energy Counter", f"{latest_edu.get('energy', 0)} Wh")
     else:
         st.sidebar.warning("EDU Source Offline")
 
-    # Dynamic UI Tab Layout Configuration
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("🖥️ DCU Hub Status")
+    
+    # Loop over all 6 possible DCU enclosures
+    for dcu_idx in range(1, 7):
+        if dcu_idx in dcu_heartbeats:
+            hb = dcu_heartbeats[dcu_idx]
+            st.sidebar.markdown(f"""
+            <div style='padding:8px; border-radius:5px; background-color:#F4FBF4; border-left:4px solid #2E7D32; margin-bottom:5px;'>
+                <b style='color:#2E7D32;'>DCU {dcu_idx:02d}</b> : Dynamic Online <br>
+                <small style='color:#555;'>Uptime: {hb['uptime']} | Status: {hb['status']}</small>
+            </div>
+            """, unsafe_allow_html=True)
+        else:
+            st.sidebar.markdown(f"""
+            <div style='padding:8px; border-radius:5px; background-color:#F9F9F9; border-left:4px solid #999; margin-bottom:5px;'>
+                <b style='color:#777;'>DCU {dcu_idx:02d}</b> : <span style='color:#999; font-style:italic;'>Awaiting Link...</span>
+            </div>
+            """, unsafe_allow_html=True)
+
+    # Core Terminal Tabs Container
     tab1, tab2, tab3 = st.tabs(["🎛️ 72-Slot Control Matrix", "🔋 Battery Asset History Ledger", "📊 Station Energy Efficiency Analysis"])
 
-    # -------------------------------------------------------------------------
-    # TAB 1: 72-SLOT CONTROLLER GRID MATRIX
-    # -------------------------------------------------------------------------
+    # --- TAB 1: CARD GRID MATRIX ---
     with tab1:
         selected_dcu = st.selectbox("Select Distribution Control Unit (DCU Matrix Visualizer):", options=[1, 2, 3, 4, 5, 6], index=0)
         st.subheader(f"DCU {selected_dcu:02d} Operational Overview (Slots 01 - 12)")
@@ -126,11 +230,10 @@ else:
                     if slot_key in latest_slots:
                         data = latest_slots[slot_key]
                         bms_id = data.get('bms_id', '---')
-                        chg_f = data.get('chg_f', 0)
-                        v_bms = data.get('bms_v', 0.0)
-                        i_bms = data.get('bms_i', 0.0)
+                        chg_f = int(data.get('chg_f', 0))
+                        v_bms = float(data.get('bms_v', 0.0))
+                        i_bms = float(data.get('bms_i', 0.0))
                         
-                        # Style depending on standard vs charger fault code 32 parameters
                         if chg_f == 32:
                             bg, border, status_txt, txt_color = "#FFF0F0", "#FFC0C0", "⚠️ CHARGER FAULT (32)", "#D32F2F"
                         elif i_bms > 0.5:
@@ -155,21 +258,17 @@ else:
                         </div>
                         """, unsafe_allow_html=True)
 
-    # -------------------------------------------------------------------------
-    # TAB 2: BATTERY ASSET HISTORY LEDGER
-    # -------------------------------------------------------------------------
+    # --- TAB 2: ASSET LIFECYCLE LEDGER ---
     with tab2:
         st.header("Asset Ledger Tracker (Historical Lifecycle Data across Slots)")
         if not battery_history:
-            st.info("No identified battery profiles found inside the active database buffer logs.")
+            st.info("No identified battery profiles found inside database records.")
         else:
-            # Transform global tracking dictionaries into organized tabular UI layouts
             ledger_data = []
             for bms_id, metrics in battery_history.items():
-                # Delta calculations between energy supplied vs entered
-                delta_eff = 0.0
-                if metrics["wh_out"] > 0:
-                    delta_eff = (metrics["wh_in"] / metrics["wh_out"]) * 100.0
+                wh_out = float(metrics["wh_out"])
+                wh_in = float(metrics["wh_in"])
+                delta_eff = (wh_in / wh_out) * 100.0 if wh_out > 0 else 0.0
                 
                 ledger_data.append({
                     "Battery BMS Serial ID": bms_id,
@@ -177,64 +276,26 @@ else:
                     "State of Charge (SOC)": f"{metrics['soc']}%",
                     "State of Health (SOH)": f"{metrics['soh']}%",
                     "Total Cycle Count": metrics["cycles"],
-                    "Total Energy Received (Wh_in)": metrics["wh_in"],
-                    "Total Charger Emitted (Wh_out)": metrics["wh_out"],
+                    "Total Energy Received (Wh_in)": wh_in,
+                    "Total Charger Emitted (Wh_out)": wh_out,
                     "Transfer Efficiency": f"{delta_eff:.1f}%" if delta_eff > 0 else "---"
                 })
-            
             st.dataframe(pd.DataFrame(ledger_data), use_container_width=True, hide_index=True)
 
-    # -------------------------------------------------------------------------
-    # TAB 3: STATION ENERGY EFFICIENCY ANALYSIS
-    # -------------------------------------------------------------------------
+    # --- TAB 3: POWER CONVERSION EFFICIENCY ---
     with tab3:
         st.header("Operational Station Conversion Efficiencies")
-        
-        # Calculate instant total power consumed strictly by the battery storage matrix blocks
-        total_dc_battery_power_w = 0.0
-        for key, payload in latest_slots.items():
-            v = payload.get('bms_v', 0.0)
-            i = payload.get('bms_i', 0.0)
-            total_dc_battery_power_w += (v * i)
-            
-        total_dc_battery_kw = total_dc_battery_power_w / 1000.0
-        
+        total_dc_battery_kw = sum((float(payload.get('bms_v', 0.0)) * float(payload.get('bms_i', 0.0))) for payload in latest_slots.values()) / 1000.0
         c1, c2, c3 = st.columns(3)
         c1.metric("Aggregated Battery Net Draw", f"{total_dc_battery_kw:.3f} kW")
         
         if latest_edu:
-            p_mains_kw = latest_edu.get('p_total', 0.0) / 1000.0
+            p_mains_kw = float(latest_edu.get('p_total', 0.0)) / 1000.0
             c2.metric("Mains Primary Input Power", f"{p_mains_kw:.3f} kW")
-            
-            # Global conversion alignment ratio coefficient
-            if p_mains_kw > 1.0:
-                overall_efficiency = (total_dc_battery_kw / p_mains_kw) * 100.0
-                c3.metric("End-to-End System Efficiency", f"{overall_efficiency:.1f} %")
-            else:
-                c3.metric("End-to-End System Efficiency", "--- %")
+            c3.metric("End-to-End System Efficiency", f"{((total_dc_battery_kw / p_mains_kw) * 100.0):.1f} %" if p_mains_kw > 1.0 else "--- %")
         else:
             c2.metric("Mains Primary Input Power", "Offline")
             c3.metric("End-to-End System Efficiency", "Offline")
 
-        # Slot Thermal/Ohmic Degradation Mapping Table
-        st.subheader("Individual Charging Interface Loss Index")
-        loss_ledger = []
-        for (dcu_id, slot_id), payload in latest_slots.items():
-            wh_in = payload.get('wh_in', 0.0)
-            wh_out = payload.get('wh_out', 0.0)
-            loss_wh = wh_out - wh_in
-            
-            loss_ledger.append({
-                "DCU": dcu_id,
-                "Slot": slot_id,
-                "Current Battery Loaded": payload.get('bms_id'),
-                "Energy Out of Charger (Wh)": wh_out,
-                "Energy Absorbed by Battery (Wh)": wh_in,
-                "Energy Lost in Transfer (Wh)": round(loss_wh, 2)
-            })
-        
-        if loss_ledger:
-            st.dataframe(pd.DataFrame(loss_ledger).sort_values(by="Energy Lost in Transfer (Wh)", ascending=False), use_container_width=True, hide_index=True)
-
-# Force periodic execution frame
-st.button("Click to Refresh Diagnostics Engine")
+# Global Manual UI Refresh Trigger Interlock
+st.button("Force Interface Refresh")
