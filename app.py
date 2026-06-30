@@ -120,7 +120,18 @@ def run_mqtt_bridge_worker():
     client.username_pw_set(MQTT_CONFIG["user"], MQTT_CONFIG["pass"])
 
     def on_connect(client, userdata, flags, rc):
+        print(f"✅ Streamlit MQTT Bridge Connected with result code {rc}")
         client.subscribe(MQTT_CONFIG["topic"])
+
+    def on_disconnect(client, userdata, rc):
+        print("⚠️ MQTT Bridge disconnected! Attempting automatic reconnection...")
+        while rc != 0:
+            try:
+                time.sleep(5)
+                client.reconnect()
+                break
+            except Exception:
+                pass
 
     def on_message(client, userdata, msg):
         try:
@@ -128,7 +139,9 @@ def run_mqtt_bridge_worker():
             payload_str = msg.payload.decode("utf-8")
             parsed_payload = json.loads(payload_str)
             
-            # Write to active session_states directly so it persists script re-executions
+            # Print to server logs for verification
+            print(f"📥 Received Live Stream: {topic}")
+            
             if topic == "SMN/EDU":
                 st.session_state["live_edu"] = parsed_payload
             elif topic == "SMN/HEARTBEAT":
@@ -143,13 +156,18 @@ def run_mqtt_bridge_worker():
             if not db_write_queue.full():
                 db_write_queue.put((topic, payload_str))
         except Exception as e:
-            print(f"Ingestion parse failure: {e}")
+            print(f"❌ Ingestion parse failure: {e}")
 
     client.on_connect = on_connect
+    client.on_disconnect = on_disconnect
     client.on_message = on_message
-    client.connect(MQTT_CONFIG["broker"], MQTT_CONFIG["port"], 60)
-    client.loop_forever()
-
+    
+    try:
+        client.connect(MQTT_CONFIG["broker"], MQTT_CONFIG["port"], 60)
+        client.loop_forever()
+    except Exception as e:
+        print(f"MQTT Client connection fatal crash: {e}")
+        
 @st.cache_resource
 def initialize_system_infrastructure():
     t1 = threading.Thread(target=run_mqtt_bridge_worker, daemon=True)
