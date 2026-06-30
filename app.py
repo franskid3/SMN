@@ -163,10 +163,11 @@ initialize_system_infrastructure()
 def query_production_history(target_date):
     try:
         conn = psycopg2.connect(**DB_CONFIG)
+        # Modified to extract energy explicitly as a numeric value for delta tracking
         edu_query = """
             SELECT created_at as timestamp, 
-                (payload->>'p_total')::float/1000.0 as p_total_kw,
-                (payload->>'energy')::float/1000.0 as energy_kwh
+                   (payload->>'p_total')::float/1000.0 as p_total_kw,
+                   (payload->>'energy')::float as raw_energy_wh
             FROM telemetry_history 
             WHERE topic = 'SMN/EDU' AND (created_at AT TIME ZONE 'UTC')::date = %s 
             ORDER BY created_at ASC;
@@ -185,7 +186,6 @@ def query_production_history(target_date):
     except Exception as e:
         st.error(f"SCADA Database Fetch Exception: {e}")
         return pd.DataFrame(), pd.DataFrame()
-
 # =========================================================================
 # INDUSTRIAL GRADE SCADA EXECUTIVE HEADLESS LAYOUT
 # =========================================================================
@@ -324,16 +324,55 @@ with historical_tab:
                 st.error(f"No telemetric records located inside database archives for {selected_historical_date}.")
             else:
                 # --- EXECUTIVE GRAPH 1: STATION RECONCILIATION CHARTS (PLOTLY) ---
+                # --- SECTION A: HISTORICAL STATION POWER DELIVERY DEMAND ---
                 st.markdown("#### 🔌 Sourced Power Grid Demand Profiles")
                 if not hist_edu.empty:
-                    fig_power = make_subplots(specs=[[{"secondary_y": True}]])
+                    # 1. Calculate precise operational metrics
+                    peak_kw = hist_edu['p_total_kw'].max()
+                    mean_kw = hist_edu['p_total_kw'].mean()
                     
+                    # Calculate energy parameters
+                    latest_meter_reading_kwh = hist_edu['raw_energy_wh'].iloc[-1] / 1000.0  # Final row value
+                    first_meter_reading_kwh = hist_edu['raw_energy_wh'].iloc[0] / 1000.0   # Starting row value
+                    net_session_consumed_kwh = latest_meter_reading_kwh - first_meter_reading_kwh
+                    
+                    # 2. Render beautiful Industrial Metric Strip for the audited date
+                    aud_col1, aud_col2, aud_col3 = st.columns(3)
+                    with aud_col1:
+                        st.markdown(f"""
+                        <div class='metric-card'>
+                            <div class='metric-title'>Session Cumulative Consumption</div>
+                            <div class='metric-value' style='color:#38A169;'>{net_session_consumed_kwh:.2f} kWh</div>
+                            <div class='metric-status' style='color:#38A169;'>📈 Net Delta This Window</div>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    with aud_col2:
+                        st.markdown(f"""
+                        <div class='metric-card'>
+                            <div class='metric-title'>Terminal Meter Registry</div>
+                            <div class='metric-value'>{latest_meter_reading_kwh:.2f} kWh</div>
+                            <div class='metric-status' style='color:#A0AEC0;'>📟 Absolute Counter Value</div>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    with aud_col3:
+                        st.markdown(f"""
+                        <div class='metric-card'>
+                            <div class='metric-title'>Peak / Average Demand Load</div>
+                            <div class='metric-value'>{peak_kw:.1f} / {mean_kw:.1f} kW</div>
+                            <div class='metric-status' style='color:#3182CE;'>⚡ Load Intensity Profile</div>
+                        </div>
+                        """, unsafe_allow_html=True)
+                        
+                    st.markdown("<br>", unsafe_allow_html=True)
+
+                    # 3. Time Series Graph Execution
+                    fig_power = make_subplots(specs=[[{"secondary_y": True}]])
                     fig_power.add_trace(
                         go.Scatter(x=hist_edu['timestamp'], y=hist_edu['p_total_kw'], name="Active Power Demand (kW)", line=dict(color="#3182CE", width=2.5)),
                         secondary_y=False
                     )
                     fig_power.add_trace(
-                        go.Scatter(x=hist_edu['timestamp'], y=hist_edu['energy_kwh'], name="Meter Energy Registry (kWh)", line=dict(color="#38A169", width=2, dash='dot')),
+                        go.Scatter(x=hist_edu['timestamp'], y=hist_edu['raw_energy_wh']/1000.0, name="Meter Energy Registry (kWh)", line=dict(color="#38A169", width=2, dash='dot')),
                         secondary_y=True
                     )
                     
@@ -344,10 +383,6 @@ with historical_tab:
                         plot_bgcolor="#1A1F2C",
                         margin=dict(l=40, r=40, t=40, b=40)
                     )
-                    fig_power.update_xaxes(title_text="Operational Clock Timeline Timestamp")
-                    fig_power.update_yaxes(title_text="<b>Active Demand Power Draw (kW)</b>", secondary_y=False)
-                    fig_power.update_yaxes(title_text="<b>Accumulated Sourced Energy (kWh)</b>", secondary_y=True)
-                    
                     st.plotly_chart(fig_power, use_container_width=True)
                 else:
                     st.info("No transformer station input parameters recorded during this calendar date window.")
