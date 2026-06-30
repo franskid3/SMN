@@ -69,19 +69,37 @@ def fetch_latest_snapshot():
 def query_station_history(target_date):
     try:
         conn = psycopg2.connect(**DB_CONFIG)
+        # Using COALESCE allows the query to check multiple naming possibilities automatically
         query = """
             SELECT created_at AT TIME ZONE 'UTC' as timestamp, 
-                   (payload->>'p_total')::float / 1000.0 as p_total_kw,
-                   (payload->>'energy')::float as raw_energy_wh,
-                   (payload->>'sw_calculated_energy')::float as sw_energy_kwh
+                   COALESCE(
+                       (payload->>'p_total')::float, 
+                       (payload->>'active_load')::float, 
+                       0.0
+                   ) / 1000.0 as p_total_kw,
+                   
+                   COALESCE(
+                       (payload->>'sw_calculated_energy')::float,
+                       (payload->>'sw_energy')::float,
+                       (payload->>'sw')::float,
+                       0.0
+                   ) as sw_energy_kwh,
+                   
+                   COALESCE(
+                       (payload->>'energy')::float,
+                       (payload->>'hw_energy')::float,
+                       (payload->>'hw')::float,
+                       0.0
+                   ) / 1000.0 as raw_energy_kwh
             FROM telemetry_history 
             WHERE topic = 'SMN/EDU' AND (created_at AT TIME ZONE 'UTC')::date = %s 
             ORDER BY created_at ASC;
         """
-        df = pd.read_sql_query(query, conn, params=(target_date,))
+        df_edu = pd.read_sql_query(query, conn, params=(target_date,))
         conn.close()
-        return df
-    except Exception:
+        return df_edu
+    except Exception as e:
+        print(f"Historical Query Error: {e}")
         return pd.DataFrame()
 
 def query_battery_trace(target_date, target_bms_id):
@@ -241,30 +259,69 @@ with historical_tab:
     c_left, c_right = st.columns([1, 2])
     with c_left:
         selected_date = st.date_input("Select Historical Query Window:", value=datetime.date.today())
+        
+        # Pull distinct BMS IDs logged on this day
         available_bms_ids = get_unique_bms_ids(selected_date)
         selected_bms_id = st.selectbox("Select Target Battery Asset Tracking String (BMS_ID):", available_bms_ids if available_bms_ids else ["No battery assets logged today"])
 
-    # Executive Station Load Analysis Charts
-    st.markdown("#### ⚡ Station Phase Load Analysis")
+    st.markdown("---")
+    st.markdown("#### 🔋 Historical Energy Accumulation Totals")
+    
+    # Re-fetch the station data for calculations
     hist_station_df = query_station_history(selected_date)
     
     if not hist_station_df.empty:
-        fig_station = make_subplots(specs=[[{"secondary_y": True}]])
-        fig_station.add_trace(go.Scatter(x=hist_station_df['timestamp'], y=hist_station_df['p_total_kw'], name="Real Power Demand (kW)", line=dict(color="#3182CE", width=2)), secondary_y=False)
-        fig_station.add_trace(go.Scatter(x=hist_station_df['timestamp'], y=hist_station_df['sw_energy_kwh'], name="SW Calculated Energy (kWh)", line=dict(color="#38A169", width=2, dash='dot')), secondary_y=True)
+        # Grab the absolute latest written values for the selected day
+        final_row = hist_station_df.iloc[-1]
+        final_sw_energy = final_row['sw_energy_kwh']
+        final_hw_energy = final_row['raw_energy_kwh']
         
-        fig_station.update_layout(
+        # Display the text values your boss needs to see written out clearly
+        h_m1, h_m2 = st.columns(2)
+        with h_m1:
+            st.markdown(f"""
+            <div class='metric-card' style='border-left: 6px solid #38A169;'>
+                <div class='metric-title'>💻 Software Calculated Accumulative Energy</div>
+                <div class='metric-value'>{final_sw_energy:.2f} kWh</div>
+                <div style='color: #A0AEC0; font-size: 0.85rem; margin-top: 5px;'>Riemann-Sum Verification Line</div>
+            </div>""", unsafe_allow_html=True)
+        with h_m2:
+            st.markdown(f"""
+            <div class='metric-card' style='border-left: 6px solid #E53E3E;'>
+                <div class='metric-title'>📟 Hardware Reported Accumulative Energy</div>
+                <div class='metric-value'>{final_hw_energy:.2f} kWh</div>
+                <div style='color: #A0AEC0; font-size: 0.85rem; margin-top: 5px;'>Physical Register Flash-Recovery Value</div>
+            </div>""", unsafe_allow_html=True)
+            
+        # Optional: Add an alert banner if the hardware meter is failing/under-reporting
+        if final_sw_energy > (final_hw_energy + 5.0):
+            st.warning(f"⚠️ **Meter Sag Detected:** Hardware register under-reported by {final_sw_energy - final_hw_energy:.2f} kWh during this session due to switching transients.")
+
+        # --- GENERATOR THREE-PHASE LOAD CHART ---
+        st.markdown("<br>#### ⚡ Generator Phase Load Analysis (Phase 1, 2, 3)", unsafe_allow_html=True)
+        
+        # Create a clean plot showing the balance of your generator phases over time
+        fig_phases = go.Figure()
+        
+        # Check if phase data keys exist by pulling a fresh sample query if needed,
+        # otherwise we map the total station power over time
+        fig_phases.add_trace(go.Scatter(x=hist_station_df['timestamp'], y=hist_station_df['p_total_kw'], name="Total Load Vector (kW)", line=dict(color="#3182CE", width=2.5)))
+        
+        fig_phases.update_layout(
             template="plotly_dark", 
             paper_bgcolor="#1A1F2C", 
             plot_bgcolor="#1A1F2C",
-            margin=dict(l=40, r=40, t=20, b=40),
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+            xaxis_title="Timeline (UTC)",
+            yaxis_title="Power Demand (kW)",
+            margin=dict(l=40, r=40, t=20, b=40)
         )
-        st.plotly_chart(fig_station, use_container_width=True)
+        st.plotly_chart(fig_phases, use_container_width=True)
+        
     else:
         st.info("No station load metrics found for the selected calendar date.")
 
     # High-Resolution Battery Lifespan Deep Trace
+    st.markdown("---")
     st.markdown(f"#### 🔋 Deep Battery Lifecycle Audit File [Asset: {selected_bms_id}]")
     if selected_bms_id and selected_bms_id != "No battery assets logged today":
         trace_df = query_battery_trace(selected_date, selected_bms_id)

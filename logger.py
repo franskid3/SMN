@@ -25,6 +25,9 @@ MQTT_CONFIG = {
 
 latest_uptime = 0
 
+last_timestamp = None
+last_power_kw = 0.0
+software_energy = 0.0
 # --- FAKE WEB SERVER FOR RENDER COMPLIANCE ---
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -50,47 +53,85 @@ def on_connect(client, userdata, flags, rc, properties=None):
 
 def on_message(client, userdata, msg):
     global latest_uptime
+    global last_timestamp
+    global last_power_kw
+    global software_energy
+
     try:
         topic = msg.topic
-        payload_str = msg.payload.decode("utf-8")
+        payload_str = msg.payload.decode()
         parsed_payload = json.loads(payload_str)
-        
+
         if topic == "SMN/HEARTBEAT":
             latest_uptime = int(parsed_payload.get("uptime", 0))
 
         if topic == "SMN/EDU":
-            p_total_kw = float(parsed_payload.get("p_total", 0.0)) / 1000.0
-            uptime_hours = latest_uptime / 3600.0
-            sw_energy = p_total_kw * uptime_hours
-            parsed_payload["sw_calculated_energy"] = round(sw_energy, 4)
+
+            current_power_kw = float(parsed_payload.get("p_total", 0)) / 1000.0
+
+            now = time.time()
+
+            if last_timestamp is not None:
+
+                delta_seconds = now - last_timestamp
+
+                software_energy += (
+                    last_power_kw *
+                    delta_seconds /
+                    3600.0
+                )
+
+            last_timestamp = now
+            last_power_kw = current_power_kw
+
+            parsed_payload["sw_calculated_energy"] = round(
+                software_energy,
+                4
+            )
+
             payload_str = json.dumps(parsed_payload)
 
         conn = psycopg2.connect(**DB_CONFIG)
+
         cursor = conn.cursor()
+
         cursor.execute(
-            "INSERT INTO telemetry_history (topic, payload) VALUES (%s, %s::jsonb);",
+            """
+            INSERT INTO telemetry_history(topic,payload)
+            VALUES(%s,%s::jsonb)
+            """,
             (topic, payload_str)
         )
+
         conn.commit()
+
         cursor.close()
         conn.close()
-        print(f"Successfully logged packet from topic: {topic}")
-        
+
+        print("Logged:", topic)
+
     except Exception as e:
-        print(f"Ingestion Pipeline Exception: {e}")
+        print(e)
 
 def main():
     # 1. Spin up the health checker thread to satisfy Render's port scan
     web_thread = threading.Thread(target=run_health_server, daemon=True)
     web_thread.start()
 
-    # 2. Start the core MQTT data broker engine
-    client = mqtt.Client(callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
+    # FIX: Generate a completely unique identifier so Render and Local never fight
+    unique_render_id = f"Rechaj_Render_Engine_{int(time.time())}"
+
+    # 2. Start the core MQTT data broker engine with the custom ID
+    client = mqtt.Client(
+        callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
+        client_id=unique_render_id
+    )
     client.username_pw_set(MQTT_CONFIG["user"], MQTT_CONFIG["pass"])
     client.on_connect = on_connect
     client.on_message = on_message
 
-    print("Starting Rechaj Energy Asynchronous Ingestion Engine...")
+    print(f"Starting Ingestion Engine with Dedicated ID: {unique_render_id}")
+    # ... remaining connection while loop ...
     while True:
         try:
             client.connect(MQTT_CONFIG["broker"], MQTT_CONFIG["port"], 60)
