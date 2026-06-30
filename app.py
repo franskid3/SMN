@@ -1,4 +1,4 @@
-
+import streamlit as st  # 👈 Make sure this is line 1!
 import psycopg2
 import pandas as pd
 import json
