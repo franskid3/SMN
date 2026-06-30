@@ -22,10 +22,7 @@ st.set_page_config(
 # Custom Industrial-Grade CSS Injection
 st.markdown("""
 <style>
-    /* Global Styles */
     .reportview-container { background: #0E1117; }
-    
-    /* Industrial Telemetry Cards */
     .metric-card {
         background-color: #1A1F2C;
         border: 1px solid #2D3748;
@@ -52,8 +49,6 @@ st.markdown("""
         margin-top: 6px;
         font-weight: bold;
     }
-    
-    /* Hardware Matrix Slots */
     .slot-box {
         padding: 14px;
         border-radius: 6px;
@@ -83,11 +78,19 @@ MQTT_CONFIG = {
     "topic": "SMN/#"
 }
 
-if "RAW_EDU" not in globals(): globals()["RAW_EDU"] = {}
-if "RAW_SLOTS" not in globals(): globals()["RAW_SLOTS"] = {}
-if "RAW_HEARTBEAT" not in globals(): globals()["RAW_HEARTBEAT"] = {"system": "OFFLINE", "uptime": 0}
+# --- THREAD SAFE MEMORY PERSISTENCE WITH SESSION STATE CACHING ---
+if "live_edu" not in st.session_state:
+    st.session_state["live_edu"] = {}
+if "live_slots" not in st.session_state:
+    st.session_state["live_slots"] = {}
+if "live_heartbeat" not in st.session_state:
+    st.session_state["live_heartbeat"] = {"system": "OFFLINE", "uptime": 0}
 
-db_write_queue = queue.Queue(maxsize=5000)
+# Global queue for writing background telemetries down to database
+if "write_queue" not in globals():
+    globals()["write_queue"] = queue.Queue(maxsize=5000)
+
+db_write_queue = globals()["write_queue"]
 
 # =========================================================================
 # MULTI-THREADED ASYNCHRONOUS PIPELINE DAEMONS
@@ -108,7 +111,7 @@ def async_db_logger_worker():
             cursor.close()
             conn.close()
         except Exception as e:
-            print(f"Database ingestion fallback log: {e}")
+            print(f"Database ingestion error fallback: {e}")
         finally:
             db_write_queue.task_done()
 
@@ -125,15 +128,16 @@ def run_mqtt_bridge_worker():
             payload_str = msg.payload.decode("utf-8")
             parsed_payload = json.loads(payload_str)
             
+            # Write to active session_states directly so it persists script re-executions
             if topic == "SMN/EDU":
-                globals()["RAW_EDU"] = parsed_payload
+                st.session_state["live_edu"] = parsed_payload
             elif topic == "SMN/HEARTBEAT":
-                globals()["RAW_HEARTBEAT"] = parsed_payload
+                st.session_state["live_heartbeat"] = parsed_payload
             elif "SLOT" in topic:
                 try:
                     parts = topic.split("/")
                     dcu_id, slot_id = int(parts[2]), int(parts[4])
-                    globals()["RAW_SLOTS"][f"{dcu_id}_{slot_id}"] = parsed_payload
+                    st.session_state["live_slots"][f"{dcu_id}_{slot_id}"] = parsed_payload
                 except Exception: pass
             
             if not db_write_queue.full():
@@ -159,11 +163,10 @@ initialize_system_infrastructure()
 # =========================================================================
 # OPTIMIZED DATA SERVICE INTEGRATION LAYER
 # =========================================================================
-@st.cache_data(ttl=30)
+@st.cache_data(ttl=15)
 def query_production_history(target_date):
     try:
         conn = psycopg2.connect(**DB_CONFIG)
-        # Modified to extract energy explicitly as a numeric value for delta tracking
         edu_query = """
             SELECT created_at as timestamp, 
                    (payload->>'p_total')::float/1000.0 as p_total_kw,
@@ -186,8 +189,9 @@ def query_production_history(target_date):
     except Exception as e:
         st.error(f"SCADA Database Fetch Exception: {e}")
         return pd.DataFrame(), pd.DataFrame()
+
 # =========================================================================
-# INDUSTRIAL GRADE SCADA EXECUTIVE HEADLESS LAYOUT
+# SCADA EXECUTIVE TERMINAL LAYOUT
 # =========================================================================
 st.markdown("## 🏭 STATION MASTER NODE (SMN) | SCADA COMMAND CORE")
 st.markdown("<p style='color:#718096; margin-top:-15px;'>Enterprise Infrastructure Operations & Analytical Asset Ledger</p>", unsafe_allow_html=True)
@@ -198,37 +202,34 @@ live_tab, historical_tab = st.tabs(["⚡ REAL-TIME CONTROL NODE", "📅 ARCHIVAL
 # TAB 1: EXECUTIVE LIVE OPERATIONS MONITORING
 # -------------------------------------------------------------------------
 with live_tab:
+    # Fragment isolated loop executing every 2 seconds without full-page reloads
     @st.fragment(run_every=2)
     def draw_live_dashboard():
-        latest_edu = globals()["RAW_EDU"]
-        latest_slots = globals()["RAW_SLOTS"]
-        hb = globals()["RAW_HEARTBEAT"]
+        latest_edu = st.session_state["live_edu"]
+        latest_slots = st.session_state["live_slots"]
+        hb = st.session_state["live_heartbeat"]
         
-        # Format System Uptime Metrics
         up_s = int(hb.get("uptime", 0))
         uptime_string = f"{up_s//86400}d {(up_s%86400)//3600}h {(up_s%3600)//60}m {up_s%60}s"
         
-        # 1. Top Industrial Metric Strip
         m_col1, m_col2, m_col3, m_col4 = st.columns(4)
-        
         p_total_kw = float(latest_edu.get("p_total", 0.0)) / 1000.0
+        
         with m_col1:
             st.markdown(f"""<div class='metric-card'><div class='metric-title'>Primary Station Load</div><div class='metric-value'>{p_total_kw:.2f} kW</div><div class='metric-status' style='color:#3182CE;'>⚡ Active Draw</div></div>""", unsafe_allow_html=True)
         with m_col2:
             st.markdown(f"""<div class='metric-card'><div class='metric-title'>Total Sourced Energy</div><div class='metric-value'>{(float(latest_edu.get('energy', 0))/1000.0):.1f} kWh</div><div class='metric-status' style='color:#A0AEC0;'>📊 Accumulative Registry</div></div>""", unsafe_allow_html=True)
         with m_col3:
-            st.markdown(f"""<div class='metric-card'><div class='metric-title'>System Status Core</div><div class='metric-value'>{hb.get('system','OFFLINE')}</div><div class='metric-status' style='color:#38A169;'>● Node Connection Stable</div></div>""", unsafe_allow_html=True)
+            st.markdown(f"""<div class='metric-card'><div class='metric-title'>System Status Core</div><div class='metric-value'>{hb.get('system','OFFLINE')}</div><div class='metric-status' style='color:#38A169;'>● Connection Handshake Connected</div></div>""", unsafe_allow_html=True)
         with m_col4:
             st.markdown(f"""<div class='metric-card'><div class='metric-title'>System Engine Uptime</div><div class='metric-value'>{uptime_string}</div><div class='metric-status' style='color:#E2E8F0;'>⏳ Continuous Running Line</div></div>""", unsafe_allow_html=True)
             
         st.markdown("<br>", unsafe_allow_html=True)
         
-        # 2. Main Transformer Phase Distribution Framework
         lay_left, lay_right = st.columns([1, 2])
         with lay_left:
             st.markdown("<h5 style='color:#A0AEC0;'>🔌 Power Transformer Load Balance</h5>", unsafe_allow_html=True)
             if latest_edu:
-                # Direct Interlock Logic Output Display
                 if int(latest_edu.get("gen1_mask", 0)) == 1 or str(latest_edu.get("gen1")) == "ACTIVE":
                     st.success("🔒 SOURCE INTERLOCK: AUX GENERATOR ALPHA ONLINE")
                 elif int(latest_edu.get("gen2_mask", 0)) == 1 or str(latest_edu.get("gen2")) == "ACTIVE":
@@ -236,21 +237,19 @@ with live_tab:
                 else:
                     st.info("🔒 SOURCE INTERLOCK: UTILITY INDUSTRIAL GRID SOURCED")
                 
-                # High Fidelity Phasor Metric Rows
                 phase_df = pd.DataFrame({
                     "Transformer Phase": ["Phase Line 1 (L1)", "Phase Line 2 (L2)", "Phase Line 3 (L3)"],
-                    "Voltage (L-N)": [f"{latest_edu.get('v1')} V", f"{latest_edu.get('v2')} V", f"{latest_edu.get('v3')} V"],
-                    "Current Intensity": [f"{latest_edu.get('i1')} A", f"{latest_edu.get('i2')} A", f"{latest_edu.get('i3')} A"]
+                    "Voltage (L-N)": [f"{latest_edu.get('v1', 0.0)} V", f"{latest_edu.get('v2', 0.0)} V", f"{latest_edu.get('v3', 0.0)} V"],
+                    "Current Intensity": [f"{latest_edu.get('i1', 0.0)} A", f"{latest_edu.get('i2', 0.0)} A", f"{latest_edu.get('i3', 0.0)} A"]
                 })
                 st.dataframe(phase_df, use_container_width=True, hide_index=True)
             else:
-                st.warning("Awaiting secure connection handshake frames from main EDU controller...")
+                st.warning("Awaiting secure incoming network payload frames...")
                 
         with lay_right:
             st.markdown("<h5 style='color:#A0AEC0;'>🎛️ Distributed Bus Allocation Grid Matrix (DCU Cluster Map)</h5>", unsafe_allow_html=True)
             active_dcu = st.selectbox("Isolate Hardware Distribution Rack Framework:", options=[1, 2, 3, 4, 5, 6], index=0)
             
-            # Draw an explicit grid array of 12 distinct charging slot positions
             for row in range(3):
                 cols = st.columns(4)
                 for col in range(4):
@@ -295,7 +294,6 @@ with live_tab:
 with historical_tab:
     st.markdown("<h4 style='color:#A0AEC0;'>📅 Historical Cluster Session Analytics Audit</h4>", unsafe_allow_html=True)
     
-    # Pre-calculated calendar offset configuration
     default_history_target = datetime.date.today() - datetime.timedelta(days=5)
     
     c_pick1, c_pick2 = st.columns([1, 3])
@@ -311,8 +309,7 @@ with historical_tab:
         st.markdown(
             "<div style='background-color:#1A1F2C; padding:15px; border-radius:6px; border: 1px solid #2D3748; font-size:0.85rem; color:#A0AEC0; margin-top:10px;'>"
             "<strong>Executive Audit System Instructions:</strong><br>"
-            "Selecting a timestamp forces a relational query against indexed telemetry logs. "
-            "Data outputs summarize net station grid efficiency, system loading metrics, and cross-sectional asset cell tracking curves."
+            "Selecting a date query scans indexed records. This aggregates session grid efficiency totals, load curves, and live metric summaries."
             "</div>", unsafe_allow_html=True
         )
 
@@ -323,49 +320,25 @@ with historical_tab:
             if hist_edu.empty and hist_slots.empty:
                 st.error(f"No telemetric records located inside database archives for {selected_historical_date}.")
             else:
-                # --- EXECUTIVE GRAPH 1: STATION RECONCILIATION CHARTS (PLOTLY) ---
-                # --- SECTION A: HISTORICAL STATION POWER DELIVERY DEMAND ---
                 st.markdown("#### 🔌 Sourced Power Grid Demand Profiles")
                 if not hist_edu.empty:
-                    # 1. Calculate precise operational metrics
                     peak_kw = hist_edu['p_total_kw'].max()
                     mean_kw = hist_edu['p_total_kw'].mean()
                     
-                    # Calculate energy parameters
-                    latest_meter_reading_kwh = hist_edu['raw_energy_wh'].iloc[-1] / 1000.0  # Final row value
-                    first_meter_reading_kwh = hist_edu['raw_energy_wh'].iloc[0] / 1000.0   # Starting row value
+                    latest_meter_reading_kwh = hist_edu['raw_energy_wh'].iloc[-1] / 1000.0
+                    first_meter_reading_kwh = hist_edu['raw_energy_wh'].iloc[0] / 1000.0
                     net_session_consumed_kwh = latest_meter_reading_kwh - first_meter_reading_kwh
                     
-                    # 2. Render beautiful Industrial Metric Strip for the audited date
                     aud_col1, aud_col2, aud_col3 = st.columns(3)
                     with aud_col1:
-                        st.markdown(f"""
-                        <div class='metric-card'>
-                            <div class='metric-title'>Session Cumulative Consumption</div>
-                            <div class='metric-value' style='color:#38A169;'>{net_session_consumed_kwh:.2f} kWh</div>
-                            <div class='metric-status' style='color:#38A169;'>📈 Net Delta This Window</div>
-                        </div>
-                        """, unsafe_allow_html=True)
+                        st.markdown(f"""<div class='metric-card'><div class='metric-title'>Session Cumulative Consumption</div><div class='metric-value' style='color:#38A169;'>{net_session_consumed_kwh:.2f} kWh</div><div class='metric-status' style='color:#38A169;'>📈 Net Delta This Window</div></div>""", unsafe_allow_html=True)
                     with aud_col2:
-                        st.markdown(f"""
-                        <div class='metric-card'>
-                            <div class='metric-title'>Terminal Meter Registry</div>
-                            <div class='metric-value'>{latest_meter_reading_kwh:.2f} kWh</div>
-                            <div class='metric-status' style='color:#A0AEC0;'>📟 Absolute Counter Value</div>
-                        </div>
-                        """, unsafe_allow_html=True)
+                        st.markdown(f"""<div class='metric-card'><div class='metric-title'>Terminal Meter Registry</div><div class='metric-value'>{latest_meter_reading_kwh:.2f} kWh</div><div class='metric-status' style='color:#A0AEC0;'>📟 Absolute Counter Value</div></div>""", unsafe_allow_html=True)
                     with aud_col3:
-                        st.markdown(f"""
-                        <div class='metric-card'>
-                            <div class='metric-title'>Peak / Average Demand Load</div>
-                            <div class='metric-value'>{peak_kw:.1f} / {mean_kw:.1f} kW</div>
-                            <div class='metric-status' style='color:#3182CE;'>⚡ Load Intensity Profile</div>
-                        </div>
-                        """, unsafe_allow_html=True)
+                        st.markdown(f"""<div class='metric-card'><div class='metric-title'>Peak / Average Demand Load</div><div class='metric-value'>{peak_kw:.1f} / {mean_kw:.1f} kW</div><div class='metric-status' style='color:#3182CE;'>⚡ Load Intensity Profile</div></div>""", unsafe_allow_html=True)
                         
                     st.markdown("<br>", unsafe_allow_html=True)
 
-                    # 3. Time Series Graph Execution
                     fig_power = make_subplots(specs=[[{"secondary_y": True}]])
                     fig_power.add_trace(
                         go.Scatter(x=hist_edu['timestamp'], y=hist_edu['p_total_kw'], name="Active Power Demand (kW)", line=dict(color="#3182CE", width=2.5)),
@@ -375,63 +348,25 @@ with historical_tab:
                         go.Scatter(x=hist_edu['timestamp'], y=hist_edu['raw_energy_wh']/1000.0, name="Meter Energy Registry (kWh)", line=dict(color="#38A169", width=2, dash='dot')),
                         secondary_y=True
                     )
-                    
-                    fig_power.update_layout(
-                        title_text=f"Grid Electrical Performance Load & Consumption Map ({selected_historical_date})",
-                        template="plotly_dark",
-                        paper_bgcolor="#1A1F2C",
-                        plot_bgcolor="#1A1F2C",
-                        margin=dict(l=40, r=40, t=40, b=40)
-                    )
+                    fig_power.update_layout(template="plotly_dark", paper_bgcolor="#1A1F2C", plot_bgcolor="#1A1F2C", margin=dict(l=40, r=40, t=40, b=40))
                     st.plotly_chart(fig_power, use_container_width=True)
                 else:
                     st.info("No transformer station input parameters recorded during this calendar date window.")
                 
-                # --- EXECUTIVE GRAPH 2: DETAILED LITHIUM ASSET PERFORMANCE CURVES ---
                 st.markdown("---")
                 st.markdown("#### 🔋 Cross-Sectional Lithium Array Asset Tracking")
                 if not hist_slots.empty:
-                    # Plotly SOC curve progression mapping
                     fig_slots = go.Figure()
-                    
-                    # Generate a clean series profile loop for each independent BMS Asset Serial
                     for unique_bms, group in hist_slots.groupby('bms_id'):
                         if unique_bms and unique_bms != 'Unknown':
-                            fig_slots.add_trace(go.Scatter(
-                                x=group['timestamp'], 
-                                y=group['soc'], 
-                                mode='lines',
-                                name=f"Pack ID: {unique_bms[:10]}...",
-                                line=dict(width=1.5)
-                            ))
+                            fig_slots.add_trace(go.Scatter(x=group['timestamp'], y=group['soc'], mode='lines', name=f"Pack ID: {unique_bms[:10]}...", line=dict(width=1.5)))
                             
-                    fig_slots.update_layout(
-                        title_text="State of Charge (SOC %) Progression Across Active Bus Slots",
-                        template="plotly_dark",
-                        paper_bgcolor="#1A1F2C",
-                        plot_bgcolor="#1A1F2C",
-                        xaxis_title="Timeline Timestamp",
-                        yaxis_title="Battery Capacity Metric (SOC %)",
-                        margin=dict(l=40, r=40, t=40, b=40)
-                    )
+                    fig_slots.update_layout(template="plotly_dark", paper_bgcolor="#1A1F2C", plot_bgcolor="#1A1F2C", margin=dict(l=40, r=40, t=40, b=40))
                     st.plotly_chart(fig_slots, use_container_width=True)
                     
-                    # Core Aggregated Summary Ledger Metrics for Executive Evaluation
                     st.markdown("##### 🔍 Pack Operational Lifecycle Metrics Ledger Summary")
-                    summary_df = hist_slots.groupby('bms_id').agg({
-                        'soc': ['min', 'max'],
-                        'bms_v': 'max',
-                        'bms_i': 'max',
-                        'instantaneous_slot_efficiency': 'mean'
-                    })
-                    summary_df.columns = [
-                        'Initial Session SOC %', 'Terminal Session SOC %', 
-                        'Peak Structural Voltage (V)', 'Max Current Intensity (A)', 
-                        'Mean Calculated Conversion Efficiency %'
-                    ]
+                    summary_df = hist_slots.groupby('bms_id').agg({'soc': ['min', 'max'], 'bms_v': 'max', 'bms_i': 'max', 'instantaneous_slot_efficiency': 'mean'})
+                    summary_df.columns = ['Initial Session SOC %', 'Terminal Session SOC %', 'Peak Structural Voltage (V)', 'Max Current Intensity (A)', 'Mean Calculated Conversion Efficiency %']
                     st.dataframe(summary_df.round(2), use_container_width=True)
-                    
-                    with st.expander("📄 Download / Audit Raw Supabase Analytics Views Log Structure"):
-                        st.dataframe(hist_slots, use_container_width=True, hide_index=True)
                 else:
                     st.info("No independent lithium CAN bus communication frames located on this daily operational window.")
