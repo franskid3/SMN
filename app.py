@@ -249,7 +249,7 @@ with historical_tab:
     hist_station_df = query_station_history(selected_date)
     
     if not hist_station_df.empty:
-        fig_station = make_subplots(specs=[["..", ".."]], secondary_y=True)
+        fig_station = make_subplots(specs=[[{"secondary_y": True}]])
         fig_station.add_trace(go.Scatter(x=hist_station_df['timestamp'], y=hist_station_df['p_total_kw'], name="Real Power Demand (kW)", line=dict(color="#3182CE", width=2)), secondary_y=False)
         fig_station.add_trace(go.Scatter(x=hist_station_df['timestamp'], y=hist_station_df['sw_energy_kwh'], name="SW Calculated Energy (kWh)", line=dict(color="#38A169", width=2, dash='dot')), secondary_y=True)
         
