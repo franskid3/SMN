@@ -7,6 +7,7 @@ import threading
 import time
 import queue
 import datetime
+import socket
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
@@ -62,6 +63,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+# Hardware Infrastructure Target Parameters
 DB_CONFIG = {
     "dbname": "postgres",
     "user": "postgres.ehncmhxcratiyupmkzpv",
@@ -78,7 +80,16 @@ MQTT_CONFIG = {
     "topic": "SMN/#"
 }
 
-# --- THREAD SAFE MEMORY PERSISTENCE WITH SESSION STATE CACHING ---
+# --- THREAD SAFE MEMORY PERSISTENCE INFRASTRUCTURE ---
+if "mqtt_telemetry_queue" not in globals():
+    globals()["mqtt_telemetry_queue"] = queue.Queue(maxsize=1000)
+if "write_queue" not in globals():
+    globals()["write_queue"] = queue.Queue(maxsize=5000)
+
+live_telemetry_queue = globals()["mqtt_telemetry_queue"]
+db_write_queue = globals()["write_queue"]
+
+# UI Persistent Caches
 if "live_edu" not in st.session_state:
     st.session_state["live_edu"] = {}
 if "live_slots" not in st.session_state:
@@ -86,16 +97,11 @@ if "live_slots" not in st.session_state:
 if "live_heartbeat" not in st.session_state:
     st.session_state["live_heartbeat"] = {"system": "OFFLINE", "uptime": 0}
 
-# Global queue for writing background telemetries down to database
-if "write_queue" not in globals():
-    globals()["write_queue"] = queue.Queue(maxsize=5000)
-
-db_write_queue = globals()["write_queue"]
-
 # =========================================================================
-# MULTI-THREADED ASYNCHRONOUS PIPELINE DAEMONS
+# MULTI-THREADED ASYNCHRONOUS PIPELINE DAEMONS (DECOUPLED FROM CONTEXT)
 # =========================================================================
 def async_db_logger_worker():
+    """Background consumer writing logs down to Supabase."""
     while True:
         item = db_write_queue.get()
         if item is None: break
@@ -116,22 +122,16 @@ def async_db_logger_worker():
             db_write_queue.task_done()
 
 def run_mqtt_bridge_worker():
-    client = mqtt.Client(callback_api_version=mqtt.CallbackAPIVersion.VERSION1)
+    """Background listener collecting incoming hardware broker lines."""
+    client = mqtt.Client(callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
     client.username_pw_set(MQTT_CONFIG["user"], MQTT_CONFIG["pass"])
 
-    def on_connect(client, userdata, flags, rc):
-        print(f"✅ Streamlit MQTT Bridge Connected with result code {rc}")
-        client.subscribe(MQTT_CONFIG["topic"])
-
-    def on_disconnect(client, userdata, rc):
-        print("⚠️ MQTT Bridge disconnected! Attempting automatic reconnection...")
-        while rc != 0:
-            try:
-                time.sleep(5)
-                client.reconnect()
-                break
-            except Exception:
-                pass
+    def on_connect(client, userdata, flags, rc, properties=None):
+        if rc == 0:
+            print("✅ Streamlit MQTT Bridge pipeline active.")
+            client.subscribe(MQTT_CONFIG["topic"])
+        else:
+            print(f"❌ MQTT Refused: {rc}")
 
     def on_message(client, userdata, msg):
         try:
@@ -139,37 +139,29 @@ def run_mqtt_bridge_worker():
             payload_str = msg.payload.decode("utf-8")
             parsed_payload = json.loads(payload_str)
             
-            # Print to server logs for verification
-            print(f"📥 Received Live Stream: {topic}")
-            
-            if topic == "SMN/EDU":
-                st.session_state["live_edu"] = parsed_payload
-            elif topic == "SMN/HEARTBEAT":
-                st.session_state["live_heartbeat"] = parsed_payload
-            elif "SLOT" in topic:
-                try:
-                    parts = topic.split("/")
-                    dcu_id, slot_id = int(parts[2]), int(parts[4])
-                    st.session_state["live_slots"][f"{dcu_id}_{slot_id}"] = parsed_payload
-                except Exception: pass
-            
+            # Non-blocking delivery straight to safe pipeline queues
+            if not live_telemetry_queue.full():
+                live_telemetry_queue.put((topic, parsed_payload))
+                
             if not db_write_queue.full():
                 db_write_queue.put((topic, payload_str))
         except Exception as e:
-            print(f"❌ Ingestion parse failure: {e}")
+            print(f"Ingestion parse failure: {e}")
 
     client.on_connect = on_connect
-    client.on_disconnect = on_disconnect
     client.on_message = on_message
     
-    try:
-        client.connect(MQTT_CONFIG["broker"], MQTT_CONFIG["port"], 60)
-        client.loop_forever()
-    except Exception as e:
-        print(f"MQTT Client connection fatal crash: {e}")
-        
+    while True:
+        try:
+            client.connect(MQTT_CONFIG["broker"], MQTT_CONFIG["port"], 60)
+            client.loop_forever()
+        except (socket.gaierror, Exception) as e:
+            print(f"📡 Broker connection unavailable ({e}). Retrying in 10s...")
+            time.sleep(10)
+
 @st.cache_resource
 def initialize_system_infrastructure():
+    """Standard, non-crashing daemon initialization."""
     t1 = threading.Thread(target=run_mqtt_bridge_worker, daemon=True)
     t2 = threading.Thread(target=async_db_logger_worker, daemon=True)
     t1.start()
@@ -220,9 +212,26 @@ live_tab, historical_tab = st.tabs(["⚡ REAL-TIME CONTROL NODE", "📅 ARCHIVAL
 # TAB 1: EXECUTIVE LIVE OPERATIONS MONITORING
 # -------------------------------------------------------------------------
 with live_tab:
-    # Fragment isolated loop executing every 2 seconds without full-page reloads
     @st.fragment(run_every=2)
     def draw_live_dashboard():
+        # --- FLUSH TELEMETRY QUEUES SAFELY WITHIN MAIN APP WINDOW CONTEXT ---
+        while not live_telemetry_queue.empty():
+            try:
+                topic, parsed_payload = live_telemetry_queue.get_nowait()
+                
+                if topic == "SMN/EDU":
+                    st.session_state["live_edu"] = parsed_payload
+                elif topic == "SMN/HEARTBEAT":
+                    st.session_state["live_heartbeat"] = parsed_payload
+                elif "SLOT" in topic:
+                    parts = topic.split("/")
+                    dcu_id, slot_id = int(parts[2]), int(parts[4])
+                    st.session_state["live_slots"][f"{dcu_id}_{slot_id}"] = parsed_payload
+                
+                live_telemetry_queue.task_done()
+            except queue.Empty:
+                break
+
         latest_edu = st.session_state["live_edu"]
         latest_slots = st.session_state["live_slots"]
         hb = st.session_state["live_heartbeat"]
@@ -312,7 +321,7 @@ with live_tab:
 with historical_tab:
     st.markdown("<h4 style='color:#A0AEC0;'>📅 Historical Cluster Session Analytics Audit</h4>", unsafe_allow_html=True)
     
-    default_history_target = datetime.date.today() - datetime.timedelta(days=5)
+    default_history_target = datetime.date.today() - datetime.timedelta(days=1)
     
     c_pick1, c_pick2 = st.columns([1, 3])
     with c_pick1:
